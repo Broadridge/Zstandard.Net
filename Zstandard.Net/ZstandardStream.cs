@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
@@ -11,15 +12,15 @@ namespace Zstandard.Net
     /// </summary>
     public class ZstandardStream : Stream
     {
+        private readonly IResourceManager resourceManager;
+
         private Stream stream;
         private CompressionMode mode;
         private Boolean leaveOpen;
         private Boolean isClosed = false;
         private Boolean isInitialized = false;
 
-        private IntPtr zstream;
-        private uint zstreamInputSize;
-        private uint zstreamOutputSize;
+        private ZstdStreamSafeHandle zstream;
 
         private byte[] data;
         private bool dataDepleted = false;
@@ -35,27 +36,18 @@ namespace Zstandard.Net
         /// <param name="stream">The stream to compress.</param>
         /// <param name="mode">One of the enumeration values that indicates whether to compress or decompress the stream.</param>
         /// <param name="leaveOpen">true to leave the stream open after disposing the <see cref="ZstandardStream"/> object; otherwise, false.</param>
-        public ZstandardStream(Stream stream, CompressionMode mode, bool leaveOpen = false)
+        public ZstandardStream(Stream stream, CompressionMode mode, bool leaveOpen = false, IResourceManager resourceManager = null)
         {
             this.stream = stream ?? throw new ArgumentNullException(nameof(stream));
             this.mode = mode;
             this.leaveOpen = leaveOpen;
+            this.resourceManager = resourceManager ?? DirectResourceManager.Instance;
 
-            if (mode == CompressionMode.Compress)
-            {
-                this.zstreamInputSize = Interop.ZSTD_CStreamInSize().ToUInt32();
-                this.zstreamOutputSize = Interop.ZSTD_CStreamOutSize().ToUInt32();
-                this.zstream = Interop.ZSTD_createCStream();
-                this.data = new byte[this.zstreamOutputSize];
-            }
+            this.data = this.resourceManager.RentMemory(mode == CompressionMode.Compress
+                ? (int)Interop.ZSTD_CStreamOutSize().ToUInt32()
+                : (int)Interop.ZSTD_DStreamOutSize().ToUInt32());
 
-            if (mode == CompressionMode.Decompress)
-            {
-                this.zstreamInputSize = Interop.ZSTD_DStreamInSize().ToUInt32();
-                this.zstreamOutputSize = Interop.ZSTD_DStreamOutSize().ToUInt32();
-                this.zstream = Interop.ZSTD_createDStream();
-                this.data = new byte[this.zstreamInputSize];
-            }
+            this.zstream = this.resourceManager.RentHandle(isCompress: mode == CompressionMode.Compress);
         }
 
         /// <summary>
@@ -155,22 +147,22 @@ namespace Zstandard.Net
         {
             if (this.isClosed)
             {
-                // do nothing
+                return;
             }
             else if (this.mode == CompressionMode.Compress)
             {
                 this.ProcessStream((zcs, buffer) => Interop.ThrowIfError(Interop.ZSTD_flushStream(zcs, buffer)));
                 this.ProcessStream((zcs, buffer) => Interop.ThrowIfError(Interop.ZSTD_endStream(zcs, buffer)));
-                this.stream.Flush();
+            }
 
-                Interop.ZSTD_freeCStream(this.zstream);
-                if (!this.leaveOpen) this.stream.Close();
-            }
-            else if (this.mode == CompressionMode.Decompress)
-            {
-                Interop.ZSTD_freeDStream(this.zstream);
-                if (!this.leaveOpen) this.stream.Close();
-            }
+            this.stream.Flush();
+            this.resourceManager.ReturnMemory(this.data);
+            this.data = null;
+            this.resourceManager.ReleaseHandle(this.zstream);
+            this.zstream = null;
+
+            if (!this.leaveOpen)
+                this.stream.Close();
 
             this.isClosed = true;
             base.Close();
@@ -274,7 +266,7 @@ namespace Zstandard.Net
 
                 while (count > 0)
                 {
-                    var inputSize = Math.Min((uint)count, this.zstreamInputSize);
+                    var inputSize = Math.Min((uint)count, this.data.Length);
 
                     // configure the outputBuffer
                     this.outputBuffer.Data = Marshal.UnsafeAddrOfPinnedArrayElement(this.data, 0);
@@ -319,7 +311,7 @@ namespace Zstandard.Net
         //-----------------------------------------------------------------------------------------
         //-----------------------------------------------------------------------------------------
 
-        private void ProcessStream(Action<IntPtr, Interop.Buffer> outputAction)
+        private void ProcessStream(Action<SafeHandle, Interop.Buffer> outputAction)
         {
             var alloc = GCHandle.Alloc(this.data, GCHandleType.Pinned);
 
